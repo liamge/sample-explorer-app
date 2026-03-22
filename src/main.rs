@@ -1,5 +1,6 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::fs;
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::BufReader;
@@ -14,16 +15,17 @@ use parking_lot::RwLock;
 use rayon::prelude::*;
 use rodio::{OutputStream, Sink, Source};
 use rustfft::{num_complex::Complex, FftPlanner};
+use serde::{Deserialize, Serialize};
 
-static AUDIO_EXT: Lazy<Vec<&str>> =
-    Lazy::new(|| vec!["wav", "aiff", "aif", "flac", "ogg", "mp3"]);
-static AUDIO_CACHE: Lazy<RwLock<HashMap<PathBuf, Vec<f32>>>> =
+static AUDIO_EXT: Lazy<Vec<&str>> = Lazy::new(|| vec!["wav", "aiff", "aif", "flac", "ogg", "mp3"]);
+static AUDIO_CACHE: Lazy<RwLock<HashMap<PathBuf, AudioClip>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 const FIXED_DAMPING: f32 = 0.78;
 const MIN_ZOOM: f32 = 24.0;
 const MAX_ZOOM: f32 = 2200.0;
 const MAX_ANALYSIS_SECONDS: f32 = 12.0;
+const WAVEFORM_BINS: usize = 512;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TimbreClass {
@@ -34,15 +36,92 @@ enum TimbreClass {
 }
 
 #[derive(Clone)]
+struct AudioClip {
+    samples: Vec<f32>,
+    sample_rate: u32,
+    channels: u16,
+    duration_s: f32,
+    peak: f32,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct PersistedItemState {
+    favorite: bool,
+    tags: Vec<String>,
+    collections: Vec<String>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedLibraryState {
+    items: HashMap<String, PersistedItemState>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct PersistedAppState {
+    default_folder: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExportPreset {
+    SourceMono16,
+    Dawk48Mono24,
+    DigitaktMono16,
+    Sp404Mono16,
+    MpcMono16,
+}
+
+impl ExportPreset {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SourceMono16 => "Source mono 16-bit",
+            Self::Dawk48Mono24 => "DAW 48k 24-bit",
+            Self::DigitaktMono16 => "Digitakt 48k 16-bit",
+            Self::Sp404Mono16 => "SP-404 48k 16-bit",
+            Self::MpcMono16 => "MPC 44.1k 16-bit",
+        }
+    }
+
+    fn sample_rate(self, fallback: u32) -> u32 {
+        match self {
+            Self::SourceMono16 => fallback,
+            Self::Dawk48Mono24 | Self::DigitaktMono16 | Self::Sp404Mono16 => 48_000,
+            Self::MpcMono16 => 44_100,
+        }
+    }
+
+    fn bits_per_sample(self) -> u16 {
+        match self {
+            Self::Dawk48Mono24 => 24,
+            _ => 16,
+        }
+    }
+
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::SourceMono16 => "src16",
+            Self::Dawk48Mono24 => "daw48k24",
+            Self::DigitaktMono16 => "digitakt48k",
+            Self::Sp404Mono16 => "sp40448k",
+            Self::MpcMono16 => "mpc44k",
+        }
+    }
+}
+
+#[derive(Clone)]
 struct SampleNode {
     path: PathBuf,
     directory_group: String,
     duration_s: f32,
+    sample_rate: u32,
+    channels: u16,
     rms: f32,
     centroid: f32,
     zcr: f32,
     flatness: f32,
     attack: f32,
+    bpm: Option<f32>,
+    transient_count: usize,
+    loop_score: f32,
     vec: Vec<f32>,
     pos: Vec2,
     vel: Vec2,
@@ -76,6 +155,8 @@ struct ExplorerApp {
     folder: Option<PathBuf>,
     nodes: Vec<SampleNode>,
     player: Option<AudioPlayer>,
+    library_state: PersistedLibraryState,
+    app_state: PersistedAppState,
     cluster_force: f32,
     status: String,
     last_layout_ms: u128,
@@ -87,14 +168,27 @@ struct ExplorerApp {
     directory_legend: Vec<(String, Color32)>,
     camera_center: Vec2,
     zoom: f32,
+    selected_clip: Option<AudioClip>,
+    waveform_cache: Vec<(f32, f32)>,
+    transient_times: Vec<f32>,
+    trim_start: f32,
+    trim_end: f32,
+    fade_in_ms: f32,
+    fade_out_ms: f32,
+    normalize_export: bool,
+    export_preset: ExportPreset,
+    tags_input: String,
+    collections_input: String,
 }
 
 impl ExplorerApp {
     fn new() -> Self {
-        Self {
+        let mut app = Self {
             folder: None,
             nodes: Vec::new(),
             player: AudioPlayer::new().ok(),
+            library_state: PersistedLibraryState::default(),
+            app_state: Self::load_app_state(),
             cluster_force: 1.0,
             status: "Open a folder".into(),
             last_layout_ms: 0,
@@ -106,7 +200,20 @@ impl ExplorerApp {
             directory_legend: Vec::new(),
             camera_center: Vec2::ZERO,
             zoom: 360.0,
-        }
+            selected_clip: None,
+            waveform_cache: Vec::new(),
+            transient_times: Vec::new(),
+            trim_start: 0.0,
+            trim_end: 1.0,
+            fade_in_ms: 0.0,
+            fade_out_ms: 0.0,
+            normalize_export: true,
+            export_preset: ExportPreset::SourceMono16,
+            tags_input: String::new(),
+            collections_input: String::new(),
+        };
+        app.load_default_folder_on_startup();
+        app
     }
 
     fn apply_style(ctx: &egui::Context) {
@@ -150,9 +257,63 @@ impl ExplorerApp {
     fn choose_folder(&mut self) {
         if let Some(p) = rfd::FileDialog::new().set_directory(".").pick_folder() {
             self.folder = Some(p.clone());
+            self.load_library_state();
             self.status = "Scanning…".into();
             self.scan_folder();
         }
+    }
+
+    fn app_state_path() -> PathBuf {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join(".sample_explorer_app_state.json")
+    }
+
+    fn load_app_state() -> PersistedAppState {
+        fs::read_to_string(Self::app_state_path())
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    fn save_app_state(&self) {
+        if let Ok(text) = serde_json::to_string_pretty(&self.app_state) {
+            let _ = fs::write(Self::app_state_path(), text);
+        }
+    }
+
+    fn load_default_folder_on_startup(&mut self) {
+        let Some(folder) = self.app_state.default_folder.clone() else {
+            return;
+        };
+        if folder.is_dir() {
+            self.folder = Some(folder);
+            self.load_library_state();
+            self.status = "Scanning default folder…".into();
+            self.scan_folder();
+        } else {
+            self.status = format!(
+                "Default folder not found: {}",
+                folder.to_string_lossy()
+            );
+        }
+    }
+
+    fn save_current_folder_as_default(&mut self) {
+        let Some(folder) = self.folder.clone() else {
+            self.status = "Open a folder before setting a default".into();
+            return;
+        };
+        self.app_state.default_folder = Some(folder.clone());
+        self.save_app_state();
+        self.status = format!("Default folder set to {}", folder.display());
+    }
+
+    fn clear_default_folder(&mut self) {
+        self.app_state.default_folder = None;
+        self.save_app_state();
+        self.status = "Cleared default startup folder".into();
     }
 
     fn scan_folder(&mut self) {
@@ -172,7 +333,10 @@ impl ExplorerApp {
             .collect();
 
         let start = Instant::now();
-        let mut nodes: Vec<SampleNode> = files.par_iter().filter_map(|p| feature_node(p).ok()).collect();
+        let mut nodes: Vec<SampleNode> = files
+            .par_iter()
+            .filter_map(|p| feature_node(p).ok())
+            .collect();
         standardize_feature_vectors(&mut nodes);
         self.neighbor_lists = build_neighbors(&nodes, 10);
         apply_embedding_and_labels(folder, &self.neighbor_lists, &mut nodes);
@@ -186,17 +350,45 @@ impl ExplorerApp {
         self.nodes = nodes;
         self.directory_legend = collect_directory_legend(&self.nodes);
         self.selected = None;
+        self.selected_clip = None;
+        self.waveform_cache.clear();
+        self.transient_times.clear();
         self.restart_sim();
         self.fit_camera_to_nodes();
     }
 
-    fn click_play(&mut self, path: &Path) {
-        let Ok(data) = load_audio_mono(path) else {
-            self.status = format!("Failed to play {:?}", path.file_name().unwrap_or_default());
-            return;
+    fn play_clip_region(&mut self, path: &Path, clip: &AudioClip, region_only: bool) {
+        let processed = processed_audio_for_export(
+            clip,
+            self.trim_start,
+            self.trim_end,
+            self.fade_in_ms,
+            self.fade_out_ms,
+            self.normalize_export,
+            self.export_preset.sample_rate(clip.sample_rate),
+        );
+        let playback = if region_only {
+            processed
+        } else {
+            clip.samples.clone()
         };
+        if playback.is_empty() {
+            self.status = "Nothing to play in current region".into();
+            return;
+        }
         if let Some(player) = &self.player {
-            let _ = player.play(&data, 44_100);
+            let rate = if region_only {
+                self.export_preset.sample_rate(clip.sample_rate)
+            } else {
+                clip.sample_rate
+            };
+            let _ = player.play(&playback, rate);
+            self.status = format!(
+                "Previewing {}",
+                path.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sample")
+            );
         }
     }
 
@@ -206,6 +398,14 @@ impl ExplorerApp {
             n.vel = Vec2::ZERO;
         }
         self.sim_active = !self.nodes.is_empty();
+        self.settle_frames = 0;
+    }
+
+    fn resume_sim(&mut self) {
+        if self.nodes.is_empty() {
+            return;
+        }
+        self.sim_active = true;
         self.settle_frames = 0;
     }
 
@@ -222,6 +422,195 @@ impl ExplorerApp {
         let extent = size.x.max(size.y).max(1.0);
         self.zoom = (650.0 / extent).clamp(MIN_ZOOM, MAX_ZOOM);
     }
+
+    fn state_path(&self) -> Option<PathBuf> {
+        self.folder
+            .as_ref()
+            .map(|folder| folder.join(".sample_explorer_state.json"))
+    }
+
+    fn load_library_state(&mut self) {
+        let Some(path) = self.state_path() else {
+            return;
+        };
+        self.library_state = fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+    }
+
+    fn save_library_state(&self) {
+        let Some(path) = self.state_path() else {
+            return;
+        };
+        if let Ok(text) = serde_json::to_string_pretty(&self.library_state) {
+            let _ = fs::write(path, text);
+        }
+    }
+
+    fn relative_key(&self, path: &Path) -> String {
+        self.folder
+            .as_ref()
+            .and_then(|folder| path.strip_prefix(folder).ok())
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    }
+
+    fn selected_item_state(&self) -> PersistedItemState {
+        let Some(idx) = self.selected else {
+            return PersistedItemState::default();
+        };
+        let Some(node) = self.nodes.get(idx) else {
+            return PersistedItemState::default();
+        };
+        self.library_state
+            .items
+            .get(&self.relative_key(&node.path))
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn update_selected_item_state(&mut self, mutate: impl FnOnce(&mut PersistedItemState)) {
+        let Some(idx) = self.selected else { return };
+        let Some(node) = self.nodes.get(idx) else {
+            return;
+        };
+        let key = self.relative_key(&node.path);
+        let state = self.library_state.items.entry(key).or_default();
+        mutate(state);
+        self.save_library_state();
+    }
+
+    fn sync_selected_text_fields(&mut self) {
+        let state = self.selected_item_state();
+        self.tags_input = state.tags.join(", ");
+        self.collections_input = state.collections.join(", ");
+    }
+
+    fn commit_selected_text_fields(&mut self) {
+        let tags = parse_csv_field(&self.tags_input);
+        let collections = parse_csv_field(&self.collections_input);
+        self.update_selected_item_state(|state| {
+            state.tags = tags;
+            state.collections = collections;
+        });
+    }
+
+    fn select_node(&mut self, idx: usize, autoplay: bool, region_only: bool) {
+        self.selected = Some(idx);
+        let Some(node) = self.nodes.get(idx).cloned() else {
+            return;
+        };
+        let Ok(clip) = load_audio_clip(&node.path) else {
+            self.status = format!(
+                "Failed to load {:?}",
+                node.path.file_name().unwrap_or_default()
+            );
+            return;
+        };
+        self.waveform_cache = build_waveform_overview(&clip.samples, WAVEFORM_BINS);
+        let analysis = resample_linear(
+            &clip.samples,
+            clip.sample_rate,
+            44_100,
+            Some((44_100.0 * MAX_ANALYSIS_SECONDS) as usize),
+        );
+        let (transient_times, bpm, _) = detect_transients_and_bpm(&analysis, 44_100);
+        self.selected_clip = Some(clip.clone());
+        self.transient_times = transient_times;
+        self.trim_start = 0.0;
+        self.trim_end = 1.0;
+        self.fade_in_ms = 0.0;
+        self.fade_out_ms = 0.0;
+        self.sync_selected_text_fields();
+        if let Some(selected_node) = self.nodes.get_mut(idx) {
+            selected_node.bpm = bpm.or(selected_node.bpm);
+        }
+        if autoplay {
+            self.play_clip_region(&node.path, &clip, region_only);
+        }
+    }
+
+    fn selected_clip_duration(&self) -> f32 {
+        self.selected_clip
+            .as_ref()
+            .map(|clip| clip.duration_s)
+            .unwrap_or(0.0)
+    }
+
+    fn export_selected(&mut self) {
+        let Some(idx) = self.selected else { return };
+        let Some(node) = self.nodes.get(idx) else {
+            return;
+        };
+        let Some(clip) = self.selected_clip.as_ref() else {
+            return;
+        };
+        let suggested = format!(
+            "{}_{}.wav",
+            node.path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("sample"),
+            self.export_preset.suffix()
+        );
+        if let Some(path) = rfd::FileDialog::new().set_file_name(&suggested).save_file() {
+            match export_clip_to_wav(
+                clip,
+                &path,
+                self.trim_start,
+                self.trim_end,
+                self.fade_in_ms,
+                self.fade_out_ms,
+                self.normalize_export,
+                self.export_preset,
+            ) {
+                Ok(()) => self.status = format!("Exported {}", path.display()),
+                Err(err) => self.status = format!("Export failed: {err}"),
+            }
+        }
+    }
+
+    fn export_batch(&mut self, favorites_only: bool) {
+        let Some(target_dir) = rfd::FileDialog::new().pick_folder() else {
+            return;
+        };
+        let needle = self.search.trim().to_lowercase();
+        let mut exported = 0usize;
+        for node in &self.nodes {
+            if !matches_filter(node, &needle) {
+                continue;
+            }
+            let state = self
+                .library_state
+                .items
+                .get(&self.relative_key(&node.path))
+                .cloned()
+                .unwrap_or_default();
+            if favorites_only && !state.favorite {
+                continue;
+            }
+            let Ok(clip) = load_audio_clip(&node.path) else {
+                continue;
+            };
+            let name = format!(
+                "{}_{}.wav",
+                node.path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("sample"),
+                self.export_preset.suffix()
+            );
+            let path = target_dir.join(name);
+            if export_clip_to_wav(&clip, &path, 0.0, 1.0, 0.0, 0.0, true, self.export_preset)
+                .is_ok()
+            {
+                exported += 1;
+            }
+        }
+        self.status = format!("Exported {exported} files to {}", target_dir.display());
+    }
 }
 
 impl App for ExplorerApp {
@@ -237,11 +626,20 @@ impl App for ExplorerApp {
                     ui.horizontal_wrapped(|ui| {
                         ui.vertical(|ui| {
                             ui.heading("Sample Explorer");
-                            ui.label(egui::RichText::new("Similarity map for audio samples").color(Color32::from_gray(165)));
+                            ui.label(
+                                egui::RichText::new("Similarity map for audio samples")
+                                    .color(Color32::from_gray(165)),
+                            );
                         });
                         ui.add_space(16.0);
                         if ui.button("Open Folder").clicked() {
                             self.choose_folder();
+                        }
+                        if ui.button("Set Default").clicked() {
+                            self.save_current_folder_as_default();
+                        }
+                        if ui.button("Clear Default").clicked() {
+                            self.clear_default_folder();
                         }
                         if ui.button("Re-center").clicked() {
                             self.fit_camera_to_nodes();
@@ -250,10 +648,14 @@ impl App for ExplorerApp {
                         ui.vertical(|ui| {
                             ui.label("Cluster Strength");
                             if ui
-                                .add(egui::Slider::new(&mut self.cluster_force, 0.2..=3.6).show_value(true))
+                                .add_sized(
+                                    [220.0, 0.0],
+                                    egui::Slider::new(&mut self.cluster_force, 0.1..=6.0)
+                                        .show_value(true),
+                                )
                                 .changed()
                             {
-                                self.restart_sim();
+                                self.resume_sim();
                             }
                         });
                         ui.separator();
@@ -271,7 +673,10 @@ impl App for ExplorerApp {
                             ui.label(&self.status);
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new("Drag to pan, scroll to zoom").color(Color32::from_gray(150)));
+                            ui.label(
+                                egui::RichText::new("Drag to pan, scroll to zoom")
+                                    .color(Color32::from_gray(150)),
+                            );
                         });
                     });
                 });
@@ -280,7 +685,7 @@ impl App for ExplorerApp {
 
         egui::SidePanel::right("inspector")
             .resizable(false)
-            .default_width(280.0)
+            .default_width(340.0)
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(Color32::from_rgb(18, 24, 31))
@@ -288,7 +693,10 @@ impl App for ExplorerApp {
                     .inner_margin(egui::Margin::same(14.0))
                     .show(ui, |ui| {
                         ui.heading("Inspector");
-                        ui.label(egui::RichText::new("Search, inspect, and compare directory groups").color(Color32::from_gray(160)));
+                        ui.label(
+                            egui::RichText::new("Search, inspect, and compare directory groups")
+                                .color(Color32::from_gray(160)),
+                        );
                         ui.add_space(8.0);
                         ui.label("Search");
                         ui.add(
@@ -298,36 +706,182 @@ impl App for ExplorerApp {
                         );
                         ui.add_space(10.0);
                         ui.label("Directories");
-                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
-                            for (group, color) in &self.directory_legend {
-                                ui.horizontal(|ui| {
-                                    let (rect, _) = ui.allocate_exact_size(Vec2::new(12.0, 12.0), Sense::hover());
-                                    ui.painter().rect_filled(rect, 4.0, *color);
-                                    ui.label(group);
-                                });
-                            }
-                        });
+                        egui::ScrollArea::vertical()
+                            .max_height(180.0)
+                            .show(ui, |ui| {
+                                for (group, color) in &self.directory_legend {
+                                    ui.horizontal(|ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            Vec2::new(12.0, 12.0),
+                                            Sense::hover(),
+                                        );
+                                        ui.painter().rect_filled(rect, 4.0, *color);
+                                        ui.label(group);
+                                    });
+                                }
+                            });
                         ui.separator();
                         if let Some(idx) = self.selected {
-                            if let Some(node) = self.nodes.get(idx) {
-                                ui.heading(
-                                    node.path
-                                        .file_name()
-                                        .and_then(|s| s.to_str())
-                                        .unwrap_or("Unknown"),
-                                );
-                                ui.label(&node.directory_group);
-                                ui.add_space(6.0);
-                                ui.label(format!("Length {:.2}s", node.duration_s));
-                                ui.label(format!("RMS {:.3}", node.rms));
-                                ui.label(format!("Centroid {:.0} Hz", node.centroid));
-                                ui.label(format!("ZCR {:.3}", node.zcr));
-                                ui.label(format!("Flatness {:.3}", node.flatness));
-                                ui.label(format!("Attack {:.3}", node.attack));
-                                if ui.button("Play Selected").clicked() {
-                                    let path = node.path.clone();
-                                    self.click_play(&path);
-                                }
+                            if let Some(node) = self.nodes.get(idx).cloned() {
+                                let item_state = self.selected_item_state();
+                                egui::ScrollArea::vertical().show(ui, |ui| {
+                                    ui.heading(
+                                        node.path
+                                            .file_name()
+                                            .and_then(|s| s.to_str())
+                                            .unwrap_or("Unknown"),
+                                    );
+                                    ui.label(&node.directory_group);
+                                    ui.add_space(6.0);
+                                    ui.label(format!(
+                                        "Length {:.2}s · {} Hz · {}ch",
+                                        node.duration_s, node.sample_rate, node.channels
+                                    ));
+                                    if let Some(clip) = &self.selected_clip {
+                                        ui.label(format!("Peak {:.3}", clip.peak));
+                                    }
+                                    ui.label(format!(
+                                        "BPM {} · Transients {} · Loop {:.0}%",
+                                        node.bpm
+                                            .map(|b| format!("{b:.1}"))
+                                            .unwrap_or_else(|| "n/a".into()),
+                                        node.transient_count,
+                                        node.loop_score * 100.0
+                                    ));
+                                    ui.label(format!("RMS {:.3}", node.rms));
+                                    ui.label(format!("Centroid {:.0} Hz", node.centroid));
+                                    ui.label(format!("ZCR {:.3}", node.zcr));
+                                    ui.label(format!("Flatness {:.3}", node.flatness));
+                                    ui.label(format!("Attack {:.3}", node.attack));
+                                    ui.add_space(8.0);
+
+                                    let mut favorite = item_state.favorite;
+                                    if ui.checkbox(&mut favorite, "Favorite").changed() {
+                                        self.update_selected_item_state(|state| {
+                                            state.favorite = favorite
+                                        });
+                                    }
+                                    ui.label("Tags");
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut self.tags_input)
+                                                .hint_text("kick, dusty, bright"),
+                                        )
+                                        .changed()
+                                    {
+                                        self.commit_selected_text_fields();
+                                    }
+                                    ui.label("Collections");
+                                    if ui
+                                        .add(
+                                            egui::TextEdit::singleline(&mut self.collections_input)
+                                                .hint_text("drum rack, live set"),
+                                        )
+                                        .changed()
+                                    {
+                                        self.commit_selected_text_fields();
+                                    }
+
+                                    ui.separator();
+                                    ui.label("Waveform");
+                                    draw_waveform(
+                                        ui,
+                                        &self.waveform_cache,
+                                        &self.transient_times,
+                                        self.trim_start,
+                                        self.trim_end,
+                                        self.selected_clip_duration(),
+                                    );
+
+                                    ui.label(format!(
+                                        "Trim {:.2}s to {:.2}s",
+                                        self.trim_start * self.selected_clip_duration(),
+                                        self.trim_end * self.selected_clip_duration()
+                                    ));
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.trim_start,
+                                            0.0..=self.trim_end,
+                                        )
+                                        .text("Start"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(
+                                            &mut self.trim_end,
+                                            self.trim_start..=1.0,
+                                        )
+                                        .text("End"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut self.fade_in_ms, 0.0..=500.0)
+                                            .text("Fade in ms"),
+                                    );
+                                    ui.add(
+                                        egui::Slider::new(&mut self.fade_out_ms, 0.0..=500.0)
+                                            .text("Fade out ms"),
+                                    );
+                                    ui.checkbox(
+                                        &mut self.normalize_export,
+                                        "Normalize preview/export",
+                                    );
+
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Play Source").clicked() {
+                                            let path = node.path.clone();
+                                            if let Some(clip) = self.selected_clip.clone() {
+                                                self.play_clip_region(&path, &clip, false);
+                                            }
+                                        }
+                                        if ui.button("Preview Region").clicked() {
+                                            let path = node.path.clone();
+                                            if let Some(clip) = self.selected_clip.clone() {
+                                                self.play_clip_region(&path, &clip, true);
+                                            }
+                                        }
+                                        if ui.button("Snap To Transients").clicked() {
+                                            if let Some((start, end)) = snap_region_to_transients(
+                                                self.trim_start,
+                                                self.trim_end,
+                                                &self.transient_times,
+                                                self.selected_clip_duration(),
+                                            ) {
+                                                self.trim_start = start;
+                                                self.trim_end = end;
+                                            }
+                                        }
+                                    });
+
+                                    ui.separator();
+                                    ui.label("Export preset");
+                                    egui::ComboBox::from_id_source("export_preset")
+                                        .selected_text(self.export_preset.label())
+                                        .show_ui(ui, |ui| {
+                                            for preset in [
+                                                ExportPreset::SourceMono16,
+                                                ExportPreset::Dawk48Mono24,
+                                                ExportPreset::DigitaktMono16,
+                                                ExportPreset::Sp404Mono16,
+                                                ExportPreset::MpcMono16,
+                                            ] {
+                                                ui.selectable_value(
+                                                    &mut self.export_preset,
+                                                    preset,
+                                                    preset.label(),
+                                                );
+                                            }
+                                        });
+                                    ui.horizontal_wrapped(|ui| {
+                                        if ui.button("Export Selected").clicked() {
+                                            self.export_selected();
+                                        }
+                                        if ui.button("Export Filtered Batch").clicked() {
+                                            self.export_batch(false);
+                                        }
+                                        if ui.button("Export Favorites").clicked() {
+                                            self.export_batch(true);
+                                        }
+                                    });
+                                });
                             }
                         } else {
                             ui.label("Select a node to inspect it.");
@@ -383,9 +937,7 @@ impl App for ExplorerApp {
                         self.camera_center,
                         self.zoom,
                     ) {
-                        self.selected = Some(idx);
-                        let path = self.nodes[idx].path.clone();
-                        self.click_play(&path);
+                        self.select_node(idx, true, false);
                     }
                 }
             }
@@ -429,7 +981,10 @@ fn draw_background(painter: &egui::Painter, rect: Rect, center: Vec2, zoom: f32)
     while x <= bottom_right.x {
         let screen_x = world_to_screen(rect, Vec2::new(x, center.y), center, zoom).x;
         painter.line_segment(
-            [Pos2::new(screen_x, rect.top()), Pos2::new(screen_x, rect.bottom())],
+            [
+                Pos2::new(screen_x, rect.top()),
+                Pos2::new(screen_x, rect.bottom()),
+            ],
             Stroke::new(1.0, grid),
         );
         x += step_world;
@@ -438,7 +993,10 @@ fn draw_background(painter: &egui::Painter, rect: Rect, center: Vec2, zoom: f32)
     while y <= bottom_right.y {
         let screen_y = world_to_screen(rect, Vec2::new(center.x, y), center, zoom).y;
         painter.line_segment(
-            [Pos2::new(rect.left(), screen_y), Pos2::new(rect.right(), screen_y)],
+            [
+                Pos2::new(rect.left(), screen_y),
+                Pos2::new(rect.right(), screen_y),
+            ],
             Stroke::new(1.0, grid),
         );
         y += step_world;
@@ -448,14 +1006,20 @@ fn draw_background(painter: &egui::Painter, rect: Rect, center: Vec2, zoom: f32)
     if top_left.x <= 0.0 && bottom_right.x >= 0.0 {
         let screen_x = world_to_screen(rect, Vec2::new(0.0, center.y), center, zoom).x;
         painter.line_segment(
-            [Pos2::new(screen_x, rect.top()), Pos2::new(screen_x, rect.bottom())],
+            [
+                Pos2::new(screen_x, rect.top()),
+                Pos2::new(screen_x, rect.bottom()),
+            ],
             Stroke::new(1.5, axis),
         );
     }
     if top_left.y <= 0.0 && bottom_right.y >= 0.0 {
         let screen_y = world_to_screen(rect, Vec2::new(center.x, 0.0), center, zoom).y;
         painter.line_segment(
-            [Pos2::new(rect.left(), screen_y), Pos2::new(rect.right(), screen_y)],
+            [
+                Pos2::new(rect.left(), screen_y),
+                Pos2::new(rect.right(), screen_y),
+            ],
             Stroke::new(1.5, axis),
         );
     }
@@ -505,12 +1069,107 @@ fn draw_graph(
         if !rect.expand(24.0).contains(p) {
             continue;
         }
-        let radius = if Some(i) == selected { 9.5_f32 } else { 6.5_f32 };
+        let radius = if Some(i) == selected {
+            9.5_f32
+        } else {
+            6.5_f32
+        };
         if Some(i) == selected {
             painter.circle_filled(p, radius + 3.0, Color32::from_white_alpha(26));
         }
         painter.circle_filled(p, radius, node.color);
         painter.circle_stroke(p, radius, Stroke::new(1.0, Color32::from_white_alpha(35)));
+    }
+}
+
+fn draw_waveform(
+    ui: &mut egui::Ui,
+    waveform: &[(f32, f32)],
+    transient_times: &[f32],
+    trim_start: f32,
+    trim_end: f32,
+    duration_s: f32,
+) {
+    let desired = Vec2::new(ui.available_width(), 120.0);
+    let (rect, _) = ui.allocate_exact_size(desired, Sense::hover());
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 8.0, Color32::from_rgb(12, 17, 24));
+    painter.rect_stroke(rect, 8.0, Stroke::new(1.0, Color32::from_gray(42)));
+    if waveform.is_empty() {
+        return;
+    }
+
+    let trim_left = rect.left() + rect.width() * trim_start;
+    let trim_right = rect.left() + rect.width() * trim_end;
+    let selection = Rect::from_min_max(
+        Pos2::new(trim_left, rect.top()),
+        Pos2::new(trim_right, rect.bottom()),
+    );
+    painter.rect_filled(
+        selection,
+        0.0,
+        Color32::from_rgba_premultiplied(74, 128, 184, 32),
+    );
+
+    let center_y = rect.center().y;
+    for (idx, (min_v, max_v)) in waveform.iter().enumerate() {
+        let x = rect.left() + rect.width() * (idx as f32 / waveform.len().max(1) as f32);
+        let y1 = center_y - max_v * rect.height() * 0.45;
+        let y2 = center_y - min_v * rect.height() * 0.45;
+        let highlighted = x >= trim_left && x <= trim_right;
+        let color = if highlighted {
+            Color32::from_rgb(106, 227, 255)
+        } else {
+            Color32::from_gray(92)
+        };
+        painter.line_segment(
+            [Pos2::new(x, y1), Pos2::new(x, y2)],
+            Stroke::new(1.0, color),
+        );
+    }
+
+    if duration_s > 0.0 {
+        for &time in transient_times {
+            let t = (time / duration_s).clamp(0.0, 1.0);
+            let x = rect.left() + rect.width() * t;
+            painter.line_segment(
+                [
+                    Pos2::new(x, rect.top() + 8.0),
+                    Pos2::new(x, rect.bottom() - 8.0),
+                ],
+                Stroke::new(1.0, Color32::from_rgba_premultiplied(255, 204, 112, 110)),
+            );
+        }
+    }
+}
+
+fn snap_region_to_transients(
+    trim_start: f32,
+    trim_end: f32,
+    transient_times: &[f32],
+    duration_s: f32,
+) -> Option<(f32, f32)> {
+    if transient_times.is_empty() || duration_s <= 0.0 {
+        return None;
+    }
+    let start_s = trim_start * duration_s;
+    let end_s = trim_end * duration_s;
+    let nearest_start = transient_times.iter().copied().min_by(|a, b| {
+        (a - start_s)
+            .abs()
+            .partial_cmp(&(b - start_s).abs())
+            .unwrap()
+    });
+    let nearest_end = transient_times
+        .iter()
+        .copied()
+        .min_by(|a, b| (a - end_s).abs().partial_cmp(&(b - end_s).abs()).unwrap());
+    match (nearest_start, nearest_end) {
+        (Some(a), Some(b)) if b > a => Some((
+            (a / duration_s).clamp(0.0, 1.0),
+            (b / duration_s).clamp(0.0, 1.0),
+        )),
+        _ => None,
     }
 }
 
@@ -572,8 +1231,29 @@ fn choose_grid_step(zoom: f32) -> f32 {
     pow10 * 10.0
 }
 
+struct TimbreSummary {
+    centroid: f32,
+    centroid_std: f32,
+    bandwidth: f32,
+    rolloff: f32,
+    flatness: f32,
+    flatness_std: f32,
+    attack: f32,
+    flux: f32,
+    flux_std: f32,
+    crest: f32,
+    band_stats: Vec<f32>,
+    band_balance: [f32; 3],
+}
+
 fn feature_node(path: &Path) -> Result<SampleNode> {
-    let samples = load_audio_mono(path)?;
+    let clip = load_audio_clip(path)?;
+    let samples = resample_linear(
+        &clip.samples,
+        clip.sample_rate,
+        44_100,
+        Some((44_100.0 * MAX_ANALYSIS_SECONDS) as usize),
+    );
     if samples.is_empty() {
         return Err(anyhow!("empty"));
     }
@@ -586,29 +1266,49 @@ fn feature_node(path: &Path) -> Result<SampleNode> {
         .count() as f32
         / samples.len().max(1) as f32;
 
-    let (centroid, rolloff, flatness, attack, flux, crest, band_stats) = timbre_features(&samples, 44_100);
+    let timbre = timbre_features(&samples, 44_100);
+    let (transients, bpm, loop_score) = detect_transients_and_bpm(&samples, 44_100);
+    let transient_density = (transients.len() as f32 / duration_s.max(0.25)).min(12.0) / 12.0;
+    let bpm_norm = bpm.map(|v| ((v - 70.0) / 110.0).clamp(0.0, 1.0)).unwrap_or(0.0);
+    let bpm_present = if bpm.is_some() { 1.0 } else { 0.0 };
     let mut vec = vec![
         duration_s / MAX_ANALYSIS_SECONDS,
         rms,
         zcr,
-        centroid / 12_000.0,
-        rolloff / 18_000.0,
-        flatness,
-        attack,
-        flux,
-        crest / 20.0,
+        timbre.centroid / 12_000.0,
+        timbre.centroid_std / 6_000.0,
+        timbre.bandwidth / 8_000.0,
+        timbre.rolloff / 18_000.0,
+        timbre.flatness,
+        timbre.flatness_std,
+        timbre.attack,
+        timbre.flux,
+        timbre.flux_std,
+        timbre.crest / 20.0,
+        transient_density,
+        bpm_norm,
+        bpm_present,
+        loop_score,
+        timbre.band_balance[0],
+        timbre.band_balance[1],
+        timbre.band_balance[2],
     ];
-    vec.extend(band_stats);
+    vec.extend(timbre.band_stats.iter().copied());
 
     Ok(SampleNode {
         path: path.to_path_buf(),
         directory_group: String::new(),
         duration_s,
+        sample_rate: clip.sample_rate,
+        channels: clip.channels,
         rms,
-        centroid,
+        centroid: timbre.centroid,
         zcr,
-        flatness,
-        attack,
+        flatness: timbre.flatness,
+        attack: timbre.attack,
+        bpm,
+        transient_count: transients.len(),
+        loop_score,
         vec,
         pos: Vec2::ZERO,
         vel: Vec2::ZERO,
@@ -618,7 +1318,7 @@ fn feature_node(path: &Path) -> Result<SampleNode> {
     })
 }
 
-fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, Vec<f32>) {
+fn timbre_features(samples: &[f32], sr: u32) -> TimbreSummary {
     let frame = 1024usize;
     let hop = 512usize;
     let nfft = 1024usize;
@@ -630,12 +1330,14 @@ fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, V
     let edges = [0.0, 120.0, 300.0, 800.0, 2000.0, 5000.0, 12000.0, 22050.0];
 
     let mut centroids = Vec::new();
+    let mut bandwidths = Vec::new();
     let mut rolloffs = Vec::new();
     let mut flatnesses = Vec::new();
     let mut fluxes = Vec::new();
     let mut crests = Vec::new();
     let mut attacks = Vec::new();
     let mut band_accum = vec![0.0f32; edges.len() - 1];
+    let mut band_energy_accum = vec![0.0f32; edges.len() - 1];
     let mut prev_mag = vec![0.0f32; nfft / 2];
     let mut frame_count = 0.0f32;
 
@@ -655,7 +1357,9 @@ fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, V
         fft.process(&mut buf);
 
         let mags: Vec<f32> = buf[..nfft / 2].iter().map(|c| c.norm()).collect();
-        let freqs: Vec<f32> = (0..(nfft / 2)).map(|i| i as f32 * sr as f32 / nfft as f32).collect();
+        let freqs: Vec<f32> = (0..(nfft / 2))
+            .map(|i| i as f32 * sr as f32 / nfft as f32)
+            .collect();
         let sum_mag = mags.iter().sum::<f32>().max(1e-6);
         let centroid = freqs
             .iter()
@@ -663,6 +1367,16 @@ fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, V
             .map(|(f, m)| f * m)
             .sum::<f32>()
             / sum_mag;
+        let bandwidth = (freqs
+            .iter()
+            .zip(mags.iter())
+            .map(|(f, m)| {
+                let delta = *f - centroid;
+                delta * delta * *m
+            })
+            .sum::<f32>()
+            / sum_mag)
+            .sqrt();
         let mut cumulative = 0.0;
         let mut rolloff = sr as f32 / 2.0;
         for (f, m) in freqs.iter().zip(mags.iter()) {
@@ -673,7 +1387,8 @@ fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, V
             }
         }
         let mean_mag = sum_mag / mags.len().max(1) as f32;
-        let geo_mag = (mags.iter().map(|m| m.max(1e-12).ln()).sum::<f32>() / mags.len().max(1) as f32).exp();
+        let geo_mag =
+            (mags.iter().map(|m| m.max(1e-12).ln()).sum::<f32>() / mags.len().max(1) as f32).exp();
         let flatness = (geo_mag / mean_mag.max(1e-6)).clamp(0.0, 1.0);
         let flux = mags
             .iter()
@@ -699,10 +1414,16 @@ fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, V
                     count += 1.0;
                 }
             }
-            band_accum[band] += if count > 0.0 { (sum / count).ln_1p() } else { 0.0 };
+            band_energy_accum[band] += sum;
+            band_accum[band] += if count > 0.0 {
+                (sum / count).ln_1p()
+            } else {
+                0.0
+            };
         }
 
         centroids.push(centroid);
+        bandwidths.push(bandwidth);
         rolloffs.push(rolloff);
         flatnesses.push(flatness);
         fluxes.push(flux);
@@ -714,19 +1435,44 @@ fn timbre_features(samples: &[f32], sr: u32) -> (f32, f32, f32, f32, f32, f32, V
     }
 
     if frame_count <= 0.0 {
-        return (0.0, 0.0, 0.0, 0.0, 0.0, 0.0, vec![0.0; edges.len() - 1]);
+        return TimbreSummary {
+            centroid: 0.0,
+            centroid_std: 0.0,
+            bandwidth: 0.0,
+            rolloff: 0.0,
+            flatness: 0.0,
+            flatness_std: 0.0,
+            attack: 0.0,
+            flux: 0.0,
+            flux_std: 0.0,
+            crest: 0.0,
+            band_stats: vec![0.0; edges.len() - 1],
+            band_balance: [0.0, 0.0, 0.0],
+        };
     }
 
-    let band_stats = band_accum.into_iter().map(|v| v / frame_count).collect::<Vec<_>>();
-    (
-        mean(&centroids),
-        mean(&rolloffs),
-        mean(&flatnesses),
-        mean(&attacks),
-        mean(&fluxes),
-        mean(&crests),
+    let band_stats = band_accum
+        .into_iter()
+        .map(|v| v / frame_count)
+        .collect::<Vec<_>>();
+    let total_band_energy = band_energy_accum.iter().sum::<f32>().max(1e-6);
+    let low_energy = band_energy_accum[..3].iter().sum::<f32>() / total_band_energy;
+    let mid_energy = band_energy_accum[3..5].iter().sum::<f32>() / total_band_energy;
+    let high_energy = band_energy_accum[5..].iter().sum::<f32>() / total_band_energy;
+    TimbreSummary {
+        centroid: mean(&centroids),
+        centroid_std: stddev(&centroids),
+        bandwidth: mean(&bandwidths),
+        rolloff: mean(&rolloffs),
+        flatness: mean(&flatnesses),
+        flatness_std: stddev(&flatnesses),
+        attack: mean(&attacks),
+        flux: mean(&fluxes),
+        flux_std: stddev(&fluxes),
+        crest: mean(&crests),
         band_stats,
-    )
+        band_balance: [low_energy, mid_energy, high_energy],
+    }
 }
 
 fn mean(xs: &[f32]) -> f32 {
@@ -735,6 +1481,22 @@ fn mean(xs: &[f32]) -> f32 {
     } else {
         xs.iter().sum::<f32>() / xs.len() as f32
     }
+}
+
+fn stddev(xs: &[f32]) -> f32 {
+    if xs.len() < 2 {
+        return 0.0;
+    }
+    let avg = mean(xs);
+    let var = xs
+        .iter()
+        .map(|x| {
+            let d = *x - avg;
+            d * d
+        })
+        .sum::<f32>()
+        / xs.len() as f32;
+    var.sqrt()
 }
 
 fn standardize_feature_vectors(nodes: &mut [SampleNode]) {
@@ -800,10 +1562,16 @@ fn apply_embedding_and_labels(folder: &Path, neighbors: &[Vec<usize>], nodes: &m
 
 fn classify_timbre(node: &SampleNode) -> TimbreClass {
     let centroid_n = node.centroid / 6000.0;
-    let vocal_score = (1.2 - (centroid_n - 0.42).abs() * 2.2) + (0.30 - node.zcr).max(0.0) + (0.45 - node.flatness).max(0.0);
-    let drum_score = node.attack * 12.0 + node.zcr * 4.0 + node.flatness * 2.5 + (node.centroid / 7000.0);
-    let tonal_score = (0.55 - node.flatness).max(0.0) * 3.5 + (0.25 - node.zcr).max(0.0) * 4.0 + (0.9 - node.attack * 5.0).max(0.0);
-    let texture_score = node.flatness * 3.0 + (node.centroid / 8000.0) + (node.attack * 2.0).min(1.5);
+    let vocal_score = (1.2 - (centroid_n - 0.42).abs() * 2.2)
+        + (0.30 - node.zcr).max(0.0)
+        + (0.45 - node.flatness).max(0.0);
+    let drum_score =
+        node.attack * 12.0 + node.zcr * 4.0 + node.flatness * 2.5 + (node.centroid / 7000.0);
+    let tonal_score = (0.55 - node.flatness).max(0.0) * 3.5
+        + (0.25 - node.zcr).max(0.0) * 4.0
+        + (0.9 - node.attack * 5.0).max(0.0);
+    let texture_score =
+        node.flatness * 3.0 + (node.centroid / 8000.0) + (node.attack * 2.0).min(1.5);
 
     let mut best = (TimbreClass::Vocal, vocal_score);
     for candidate in [
@@ -1055,7 +1823,7 @@ fn step_sim(nodes: &mut [SampleNode], neighbors: &[Vec<usize>], force: f32, damp
     }
 
     let mut accs = vec![Vec2::ZERO; n];
-    let force_scale = force.clamp(0.2, 3.6);
+    let force_scale = force.clamp(0.1, 6.0);
     let separation_exp = ((force_scale - 1.0) * 0.72).exp();
     let repulsion_radius = 0.34f32 + 0.12 * separation_exp.min(5.0);
 
@@ -1141,7 +1909,10 @@ fn build_neighbors(nodes: &[SampleNode], k: usize) -> Vec<Vec<usize>> {
 }
 
 fn max_speed(nodes: &[SampleNode]) -> f32 {
-    nodes.iter().map(|n| n.vel.length()).fold(0.0, |a, b| a.max(b))
+    nodes
+        .iter()
+        .map(|n| n.vel.length())
+        .fold(0.0, |a, b| a.max(b))
 }
 
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
@@ -1151,7 +1922,7 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
     dot / (na * nb)
 }
 
-fn load_audio_mono(path: &Path) -> Result<Vec<f32>> {
+fn load_audio_clip(path: &Path) -> Result<AudioClip> {
     if let Some(cached) = AUDIO_CACHE.read().get(path).cloned() {
         return Ok(cached);
     }
@@ -1162,36 +1933,26 @@ fn load_audio_mono(path: &Path) -> Result<Vec<f32>> {
         .unwrap_or("")
         .to_ascii_lowercase();
 
-    let mut data = if ext == "wav" {
-        read_wav(path)?
+    let clip = if ext == "wav" {
+        read_wav_clip(path)?
     } else {
-        let file = File::open(path)?;
-        let src = rodio::Decoder::new(BufReader::new(file))?;
-        src.convert_samples::<f32>()
-            .take(44_100 * 12)
-            .collect::<Vec<f32>>()
+        read_decoder_clip(path)?
     };
 
-    if data.is_empty() {
-        return Err(anyhow!("empty"));
-    }
-    let peak = data.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
-    for v in &mut data {
-        *v /= peak;
-    }
-
     let mut cache = AUDIO_CACHE.write();
-    cache.insert(path.to_path_buf(), data.clone());
-    Ok(data)
+    cache.insert(path.to_path_buf(), clip.clone());
+    Ok(clip)
 }
 
-fn read_wav(path: &Path) -> Result<Vec<f32>> {
+fn read_wav_clip(path: &Path) -> Result<AudioClip> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
-    let sr = spec.sample_rate;
+    let sample_rate = spec.sample_rate;
 
     let samples: Vec<f32> = match (spec.sample_format, spec.bits_per_sample) {
-        (hound::SampleFormat::Float, 32) => reader.samples::<f32>().filter_map(|s| s.ok()).collect(),
+        (hound::SampleFormat::Float, 32) => {
+            reader.samples::<f32>().filter_map(|s| s.ok()).collect()
+        }
         (_, 8) => reader
             .samples::<i8>()
             .filter_map(|s| s.ok())
@@ -1214,29 +1975,260 @@ fn read_wav(path: &Path) -> Result<Vec<f32>> {
             .collect(),
     };
 
-    let channels = spec.channels.max(1) as usize;
-    let mut mono = Vec::with_capacity(samples.len() / channels.max(1));
-    for chunk in samples.chunks(channels) {
-        let avg = chunk.iter().copied().sum::<f32>() / channels as f32;
-        mono.push(avg);
+    Ok(build_audio_clip(samples, sample_rate, spec.channels.max(1)))
+}
+
+fn read_decoder_clip(path: &Path) -> Result<AudioClip> {
+    let file = File::open(path)?;
+    let decoder = rodio::Decoder::new(BufReader::new(file))?;
+    let sample_rate = decoder.sample_rate();
+    let channels = decoder.channels();
+    let samples = decoder.convert_samples::<f32>().collect::<Vec<_>>();
+    Ok(build_audio_clip(samples, sample_rate, channels))
+}
+
+fn build_audio_clip(samples: Vec<f32>, sample_rate: u32, channels: u16) -> AudioClip {
+    let channels_usize = channels.max(1) as usize;
+    let mono = if channels_usize == 1 {
+        samples
+    } else {
+        samples
+            .chunks(channels_usize)
+            .map(|chunk| chunk.iter().copied().sum::<f32>() / channels_usize as f32)
+            .collect::<Vec<_>>()
+    };
+    let peak = mono.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    let duration_s = mono.len() as f32 / sample_rate.max(1) as f32;
+    AudioClip {
+        samples: mono,
+        sample_rate,
+        channels,
+        duration_s,
+        peak,
+    }
+}
+
+fn build_waveform_overview(samples: &[f32], bins: usize) -> Vec<(f32, f32)> {
+    if samples.is_empty() || bins == 0 {
+        return Vec::new();
+    }
+    let chunk_size = (samples.len() / bins.max(1)).max(1);
+    samples
+        .chunks(chunk_size)
+        .take(bins)
+        .map(|chunk| {
+            let mut min_v = 1.0f32;
+            let mut max_v = -1.0f32;
+            for &sample in chunk {
+                min_v = min_v.min(sample);
+                max_v = max_v.max(sample);
+            }
+            (min_v, max_v)
+        })
+        .collect()
+}
+
+fn resample_linear(
+    samples: &[f32],
+    src_rate: u32,
+    target_rate: u32,
+    max_len: Option<usize>,
+) -> Vec<f32> {
+    if samples.is_empty() {
+        return Vec::new();
+    }
+    if src_rate == target_rate {
+        let mut out = samples.to_vec();
+        if let Some(limit) = max_len {
+            out.truncate(limit);
+        }
+        return out;
+    }
+    let ratio = target_rate as f32 / src_rate.max(1) as f32;
+    let new_len = ((samples.len() as f32) * ratio).round().max(1.0) as usize;
+    let out_len = max_len.map(|limit| limit.min(new_len)).unwrap_or(new_len);
+    let mut res = Vec::with_capacity(out_len);
+    for i in 0..out_len {
+        let src_pos = i as f32 / ratio;
+        let idx = src_pos.floor() as usize;
+        let frac = src_pos - idx as f32;
+        let s0 = *samples.get(idx).unwrap_or(&0.0);
+        let s1 = *samples.get(idx + 1).unwrap_or(&s0);
+        res.push(s0 * (1.0 - frac) + s1 * frac);
+    }
+    res
+}
+
+fn detect_transients_and_bpm(samples: &[f32], sr: u32) -> (Vec<f32>, Option<f32>, f32) {
+    let frame = 1024usize;
+    let hop = 512usize;
+    if samples.len() < frame {
+        return (Vec::new(), None, 0.0);
     }
 
-    if sr != 44_100 {
-        let ratio = 44_100.0 / sr as f32;
-        let new_len = (mono.len() as f32 * ratio) as usize;
-        let mut res = Vec::with_capacity(new_len);
-        for i in 0..new_len {
-            let src_pos = i as f32 / ratio;
-            let idx = src_pos.floor() as usize;
-            let frac = src_pos - idx as f32;
-            let s0 = *mono.get(idx).unwrap_or(&0.0);
-            let s1 = *mono.get(idx + 1).unwrap_or(&s0);
-            res.push(s0 * (1.0 - frac) + s1 * frac);
-        }
-        Ok(res)
-    } else {
-        Ok(mono)
+    let mut envelope = Vec::new();
+    let mut prev_energy = 0.0f32;
+    let mut start = 0usize;
+    while start + frame <= samples.len() {
+        let energy = samples[start..start + frame]
+            .iter()
+            .map(|s| s.abs())
+            .sum::<f32>()
+            / frame as f32;
+        envelope.push((energy - prev_energy).max(0.0));
+        prev_energy = energy;
+        start += hop;
     }
+    if envelope.is_empty() {
+        return (Vec::new(), None, 0.0);
+    }
+
+    let mean_env = envelope.iter().sum::<f32>() / envelope.len() as f32;
+    let threshold = mean_env * 2.2;
+    let mut transient_times = Vec::new();
+    for (idx, &value) in envelope.iter().enumerate() {
+        let prev = envelope.get(idx.saturating_sub(1)).copied().unwrap_or(0.0);
+        let next = envelope.get(idx + 1).copied().unwrap_or(0.0);
+        if value > threshold && value >= prev && value >= next {
+            transient_times.push(idx as f32 * hop as f32 / sr as f32);
+        }
+    }
+
+    let mut intervals = transient_times
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|dt| *dt > 0.18 && *dt < 1.5)
+        .collect::<Vec<_>>();
+    intervals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let bpm = intervals
+        .get(intervals.len().saturating_sub(1) / 2)
+        .copied()
+        .map(|median_dt| {
+            let mut bpm = 60.0 / median_dt.max(1e-3);
+            while bpm < 70.0 {
+                bpm *= 2.0;
+            }
+            while bpm > 180.0 {
+                bpm *= 0.5;
+            }
+            bpm
+        });
+
+    let loop_score = if intervals.len() >= 2 {
+        let mean = intervals.iter().sum::<f32>() / intervals.len() as f32;
+        let variance = intervals
+            .iter()
+            .map(|dt| {
+                let diff = *dt - mean;
+                diff * diff
+            })
+            .sum::<f32>()
+            / intervals.len() as f32;
+        let stability = 1.0 - (variance.sqrt() / mean.max(1e-3)).clamp(0.0, 1.0);
+        let density = (transient_times.len() as f32 / 16.0).clamp(0.0, 1.0);
+        (0.75 * stability + 0.25 * density).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    (transient_times, bpm, loop_score)
+}
+
+fn parse_csv_field(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|part| part.trim())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_string())
+        .collect()
+}
+
+fn processed_audio_for_export(
+    clip: &AudioClip,
+    trim_start: f32,
+    trim_end: f32,
+    fade_in_ms: f32,
+    fade_out_ms: f32,
+    normalize: bool,
+    target_rate: u32,
+) -> Vec<f32> {
+    let len = clip.samples.len();
+    if len == 0 {
+        return Vec::new();
+    }
+    let start_idx = ((trim_start.clamp(0.0, 1.0)) * len as f32).floor() as usize;
+    let end_idx = ((trim_end.clamp(0.0, 1.0)) * len as f32).ceil() as usize;
+    let start_idx = start_idx.min(len.saturating_sub(1));
+    let end_idx = end_idx.max(start_idx + 1).min(len);
+    let mut out = clip.samples[start_idx..end_idx].to_vec();
+
+    let fade_in_samples = ((fade_in_ms / 1000.0) * clip.sample_rate as f32) as usize;
+    let fade_out_samples = ((fade_out_ms / 1000.0) * clip.sample_rate as f32) as usize;
+    for i in 0..fade_in_samples.min(out.len()) {
+        let gain = i as f32 / fade_in_samples.max(1) as f32;
+        out[i] *= gain;
+    }
+    for i in 0..fade_out_samples.min(out.len()) {
+        let idx = out.len() - 1 - i;
+        let gain = i as f32 / fade_out_samples.max(1) as f32;
+        out[idx] *= gain;
+    }
+
+    if normalize {
+        let peak = out.iter().fold(0.0f32, |m, v| m.max(v.abs())).max(1e-6);
+        for sample in &mut out {
+            *sample /= peak;
+        }
+    }
+
+    resample_linear(&out, clip.sample_rate, target_rate, None)
+}
+
+fn export_clip_to_wav(
+    clip: &AudioClip,
+    path: &Path,
+    trim_start: f32,
+    trim_end: f32,
+    fade_in_ms: f32,
+    fade_out_ms: f32,
+    normalize: bool,
+    preset: ExportPreset,
+) -> Result<()> {
+    let sample_rate = preset.sample_rate(clip.sample_rate);
+    let samples = processed_audio_for_export(
+        clip,
+        trim_start,
+        trim_end,
+        fade_in_ms,
+        fade_out_ms,
+        normalize,
+        sample_rate,
+    );
+    if samples.is_empty() {
+        return Err(anyhow!("empty render"));
+    }
+
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: preset.bits_per_sample(),
+        sample_format: hound::SampleFormat::Int,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    match preset.bits_per_sample() {
+        24 => {
+            for sample in samples {
+                writer.write_sample((sample.clamp(-1.0, 1.0) * 8_388_607.0) as i32)?;
+            }
+        }
+        _ => {
+            for sample in samples {
+                writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32) as i16)?;
+            }
+        }
+    }
+    writer.finalize()?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
