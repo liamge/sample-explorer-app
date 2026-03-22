@@ -15,6 +15,7 @@ A basic Python desktop app for sample exploration and lightweight sample creatio
 - Convert to mono
 - Export processed samples
 - Export a quick one-shot version
+- Graph view that clusters samples by similarity with adjustable force (Obsidian-style)
 
 ## Supported Formats
 
@@ -28,14 +29,14 @@ A basic Python desktop app for sample exploration and lightweight sample creatio
 - Python 3.10+
 - macOS recommended
 
-## Setup
+## Setup (Rust version – default)
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-python sample_explorer_app.py
+cd sample_explorer_rs
+cargo run --release
 ```
+
+Python UI remains in `sample_explorer_app.py`, but the Rust `eframe`/`rodio` app is the default and fastest way to explore clusters.
 
 ## Notes for macOS
 
