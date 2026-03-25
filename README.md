@@ -1,10 +1,10 @@
 # Sample Explorer App
 
-A basic Python desktop app for sample exploration and lightweight sample creation on macOS.
+A basic Rust desktop app for sample exploration and lightweight sample creation on macOS.
 
 ## Features
 
-- Browse a folder of samples
+- Browse a folder of samples as a 2D cluster projection
 - Search sample filenames
 - Preview audio files
 - View a simple waveform
